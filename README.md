@@ -1,4 +1,4 @@
-# System App Nuker
+# 为 System App Nuker 添加 MIUIX 风格界面和中文翻译
 
 Bloatware sucks. This module lets you disable pre-installed system apps and services that don’t serve you.
 
