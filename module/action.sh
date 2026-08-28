@@ -22,13 +22,13 @@ manual_download() {
 
 download() {
     PATH=/data/data/com.termux/files/usr/bin:/data/adb/magisk:/data/adb/magisk:$PATH
-    for attempt in {1..3}; do  # Try up to 3 times
+    for attempt in 1 2 3; do  # Try up to 3 times
         if command -v curl >/dev/null 2>&1; then
             timeout 10 curl -Ls "$1" && return 0
-        elif command -v busybox wget >/dev/null 2>&1; then
+        elif command -v busybox >/dev/null 2>&1; then
             timeout 10 busybox wget --no-check-certificate -qO- "$1" && return 0
         fi
-        echo "⚠️ Download failed, retrying ($attempt/3)..."
+        echo "⚠️ Download failed, retrying ($attempt/3)..." >&2
         sleep 3
     done
     echo "❌ Download failed after 3 attempts. Please check your internet." >&2
@@ -41,9 +41,10 @@ get_webui() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "📥 Downloading KSU WebUI Standalone..."
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    mkdir -p "$TMP_DIR" || manual_download "Error: Unable to create temporary directory."
     API="https://api.github.com/repos/KOWX712/KsuWebUIStandalone/releases/latest"
-    ping -c 1 -w 5 raw.githubusercontent.com &>/dev/null || manual_download "Error: Unable to connect to raw.githubusercontent.com, please download manually."
-    URL=$(download "$API" | grep -o '"browser_download_url": "[^"]*"' | cut -d '"' -f 4) || manual_download "Error: Unable to get latest version, please download manually."
+    URL=$(download "$API" | grep -o '"browser_download_url": "[^"]*"' | cut -d '"' -f 4)
+    [ -n "$URL" ] || manual_download "Error: Unable to get latest version, please download manually."
     download "$URL" > "$APK_PATH" || manual_download "Error: APK download failed, please download manually."
 
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

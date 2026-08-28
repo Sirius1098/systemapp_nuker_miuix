@@ -1,6 +1,8 @@
 import { listPackages, getPackagesInfo, type PackagesInfo } from 'kernelsu-alt'
 import { PERSIST_DIR } from '../constant'
 import { File } from './File'
+import { isDev } from './utils'
+import { parseNukeLine } from './nukeList'
 
 export interface AppInfo extends Omit<PackagesInfo, 'versionName' | 'versionCode' | 'uid'> {
   versionName: string | null
@@ -15,9 +17,21 @@ interface NukeInfo {
   appLabel: string
 }
 
+function parseNuking(content: string): NukeInfo[] {
+  return content
+    .split('\n')
+    .filter(line => line.trim() && !line.startsWith('#') && !line.startsWith('$'))
+    .map(line => {
+      const { packageName, appLabel } = parseNukeLine(line)
+      return { packageName, appLabel }
+    })
+}
+
 export default class AppList {
   #apps: AppInfo[] = []
   #nuking: NukeInfo[] = []
+  #savedNuking: NukeInfo[] = []
+  #writable = false
   #ready: Promise<void>
 
   readonly #nukeListPath = `${PERSIST_DIR}/nuke_list.txt`
@@ -31,13 +45,24 @@ export default class AppList {
   }
 
   async #refresh() {
-    await this.#getSystemAppList()
-    await this.#getNukedAppList()
-    await this.#getNukePendingList()
+    const previousApps = this.#apps
+    const previousNuking = this.#nuking.map(app => ({ ...app }))
+    this.#writable = false
+    try {
+      await this.#getSystemAppList()
+      await this.#getNukedAppList()
+      await this.#getNukePendingList()
+      this.#writable = true
+    } catch (error) {
+      this.#apps = previousApps
+      this.#nuking = previousNuking
+      this.#updatePending()
+      throw error
+    }
   }
 
   async #getSystemAppList() {
-    if (import.meta.env.DEV) {
+    if (isDev()) {
       this.#apps = [
         { packageName: 'com.android.settings', versionName: '14.0', versionCode: 1, appLabel: 'Settings', isSystem: true, uid: 1000, nuked: false, pending: false },
         { packageName: 'com.android.systemui', versionName: '14.0', versionCode: 1, appLabel: 'System UI', isSystem: true, uid: 1000, nuked: false, pending: false },
@@ -52,7 +77,7 @@ export default class AppList {
       return
     }
 
-    const pkgs = await listPackages('system').catch(() => [])
+    const pkgs = await listPackages('system')
 
     let infos: PackagesInfo[]
     try {
@@ -76,7 +101,7 @@ export default class AppList {
   }
 
   async #getNukedAppList() {
-    if (import.meta.env.DEV) {
+    if (isDev()) {
       for (const pkg of ['com.android.chrome', 'com.facebook.katana']) {
         const existing = this.#apps.find(app => app.packageName === pkg)
         if (existing) {
@@ -92,15 +117,11 @@ export default class AppList {
       return
     }
 
-    const nukeList = await File.read(`${this.#nukeListPath}.old`).catch(() => '')
+    const nukeList = await File.readIfExists(`${this.#nukeListPath}.old`)
     const nukedApps = nukeList.split('\n').filter(line => line.trim() && !line.startsWith('#') && !line.startsWith('$'))
 
     for (const line of nukedApps) {
-      // "<pkg> <path> <label>" (path might be empty on old 2-field lines)
-      const first = line.indexOf(' ')
-      const second = first === -1 ? -1 : line.indexOf(' ', first + 1)
-      const pkg = first === -1 ? line : line.slice(0, first)
-      const label = second === -1 ? (first === -1 ? line : line.slice(first + 1)) : line.slice(second + 1)
+      const { packageName: pkg, appLabel: label } = parseNukeLine(line)
 
       const existing = this.#apps.find(app => app.packageName === pkg)
       if (existing) {
@@ -121,41 +142,27 @@ export default class AppList {
   }
 
   async #getNukePendingList() {
-    if (import.meta.env.DEV) {
+    if (isDev()) {
       const nukingPkgs = ['com.miui.videoplayer', 'com.xiaomi.midrive']
-      this.#apps.forEach(app => {
-        const inNukingList = nukingPkgs.includes(app.packageName)
-        if (app.nuked && !inNukingList) {
-          app.pending = true
-        } else if (!app.nuked && inNukingList) {
-          app.pending = true
-        }
-      })
+      this.#nuking = this.#apps
+        .filter(app => nukingPkgs.includes(app.packageName))
+        .map(app => ({ packageName: app.packageName, appLabel: app.appLabel }))
+      this.#savedNuking = this.#nuking.map(app => ({ ...app }))
+      this.#updatePending()
       return
     }
 
-    const nukeList = await File.read(`${this.#nukeListPath}`).catch(() => '')
-    const nukedApps = nukeList.split('\n').filter(line => line.trim() && !line.startsWith('#') && !line.startsWith('$'))
-    this.#nuking = nukedApps.map((line: string) => {
-      // "<pkg> <path> <label>" (path might be empty on old 2-field lines)
-      const first = line.indexOf(' ')
-      const second = first === -1 ? -1 : line.indexOf(' ', first + 1)
-      const pkg = first === -1 ? line : line.slice(0, first)
-      const label = second === -1 ? (first === -1 ? line : line.slice(first + 1)) : line.slice(second + 1)
-      return {
-        packageName: pkg,
-        appLabel: label,
-      }
-    })
+    const nukeList = await File.readIfExists(`${this.#nukeListPath}`)
+    this.#nuking = parseNuking(nukeList)
+    this.#savedNuking = this.#nuking.map(app => ({ ...app }))
+    this.#updatePending()
+  }
 
+  #updatePending() {
     const nukingPkgs = new Set(this.#nuking.map(n => n.packageName))
     this.#apps.forEach(app => {
       const inNukingList = nukingPkgs.has(app.packageName)
-      if (app.nuked && !inNukingList) {
-        app.pending = true
-      } else if (!app.nuked && inNukingList) {
-        app.pending = true
-      }
+      app.pending = app.nuked ? !inNukingList : inNukingList
     })
   }
 
@@ -232,23 +239,40 @@ export default class AppList {
 
   /** Writes the current nuking list to persistent storage. */
   async write() {
+    if (!this.#writable) {
+      this.#nuking = this.#savedNuking.map(app => ({ ...app }))
+      this.#updatePending()
+      return false
+    }
+    let previous = this.#savedNuking.map(app => ({ ...app }))
+    let current: string
     try {
       // keep the saved path for apps already nuked (pm cant see them once
       // hidden, so keep it or it gets lost on rewrite)
-      const current = await File.read(`${this.#nukeListPath}`).catch(() => '')
+      current = await File.readIfExists(`${this.#nukeListPath}`)
+      previous = parseNuking(current)
+    } catch {
+      this.#nuking = previous
+      this.#updatePending()
+      this.#writable = false
+      return false
+    }
+
+    try {
       const pathOf = new Map<string, string>()
       for (const l of current.split('\n')) {
-        const first = l.indexOf(' ')
-        const second = first === -1 ? -1 : l.indexOf(' ', first + 1)
-        if (first === -1) continue
-        pathOf.set(l.slice(0, first), second === -1 ? '' : l.slice(first + 1, second))
+        if (!l.trim() || l.startsWith('#') || l.startsWith('$')) continue
+        const { packageName, apkPath } = parseNukeLine(l)
+        pathOf.set(packageName, apkPath)
       }
 
       const lines = this.#nuking.map(n => `${n.packageName} ${pathOf.get(n.packageName) ?? ''} ${n.appLabel.replace(/\n/g, ' ')}`)
       await File.write(`${this.#nukeListPath}`, lines.join('\n'))
-      await this.#refresh()
+      this.#savedNuking = this.#nuking.map(app => ({ ...app }))
       return true
     } catch {
+      this.#nuking = previous
+      this.#updatePending()
       return false
     }
   }

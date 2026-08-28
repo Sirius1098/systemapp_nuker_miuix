@@ -10,35 +10,36 @@ import { Cli } from '../lib/Cli'
 import SnackBar, { useSnackBar } from '../components/SnackBar'
 import Fab from '../components/Fab'
 import { categories } from '../data/category'
+import { runMutation } from '../lib/mutationLock'
 
 export default function Restore() {
   const { t } = useTranslation()
-  const snackBar = useSnackBar()
+  const { state: snackBarState, show: showSnackBar, hide: hideSnackBar } = useSnackBar()
   const appListManager = useAppList()
   const [apps, setApps] = useState<AppInfo[]>([])
   const [loading, setLoading] = useState(true)
+  const [loadFailed, setLoadFailed] = useState(false)
   const [fabVisible, setFabVisible] = useState(true)
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedCategories, setSelectedCategories] = useState<string[]>([])
   const appListRef = useRef<AppListHandle>(null)
-  const processingRef = useRef(false)
 
   useEffect(() => {
     appListManager.waitForReady().then(() => {
       setApps(appListManager.nukedAppList)
       setLoading(false)
+    }).catch(() => {
+      setLoadFailed(true)
+      setLoading(false)
     })
-  }, [])
+  }, [appListManager])
 
   const handleFabVisibilityChange = useCallback((visible: boolean) => {
     setFabVisible(visible)
   }, [])
 
   const handleFabClick = useCallback(async () => {
-    if (processingRef.current) return
-    processingRef.current = true
-
-    try {
+    const started = await runMutation(async () => {
       const selected = appListRef.current?.getSelectedPackages() ?? []
       const currentApps = appListManager.nukedAppList
       let count = 0
@@ -56,20 +57,24 @@ export default function Restore() {
       }
 
       if (count === 0) return
-      snackBar.show(t('global.processing'), true, 60000)
+      showSnackBar(t('global.processing'), true, 60000)
 
       const ok = await appListManager.write()
       if (!ok) {
-        snackBar.show(t('global.write_error'), false)
-      } else {
-        await Cli.nuke(snackBar.show)
-        await appListManager.refresh()
+        showSnackBar(t('global.write_error'), false)
         setApps(appListManager.nukedAppList)
+      } else {
+        await Cli.nuke(showSnackBar)
+        await appListManager.refresh()
+          .then(() => setApps(appListManager.nukedAppList))
+          .catch(() => {
+            setLoadFailed(true)
+            showSnackBar(t('global.read_error'), false)
+          })
       }
-    } finally {
-      processingRef.current = false
-    }
-  }, [])
+    })
+    if (!started) showSnackBar(t('global.processing'), true, 3000)
+  }, [appListManager, showSnackBar, t])
 
   const toggleCategory = (categoryId: string) => {
     setSelectedCategories(prev =>
@@ -87,6 +92,14 @@ export default function Restore() {
     )
   }
 
+  if (loadFailed) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <span className="text-error">{t('global.read_error')}</span>
+      </div>
+    )
+  }
+
   if (apps.length === 0) {
     return (
       <div className="flex flex-col h-full -mb-18">
@@ -99,7 +112,7 @@ export default function Restore() {
             <span className="text-on-surface-variant text-sm">{t('restore.empty')}</span>
           </div>
         </div>
-        <SnackBar state={snackBar.state} onHide={snackBar.hide} fabVisible={fabVisible} />
+        <SnackBar state={snackBarState} onHide={hideSnackBar} fabVisible={fabVisible} />
       </div>
     )
   }
@@ -131,7 +144,7 @@ export default function Restore() {
         variant="primary"
         onVisibilityChange={handleFabVisibilityChange}
       />
-      <SnackBar state={snackBar.state} onHide={snackBar.hide} fabVisible={fabVisible} />
+      <SnackBar state={snackBarState} onHide={hideSnackBar} fabVisible={fabVisible} />
     </>
   )
 }

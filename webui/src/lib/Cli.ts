@@ -5,18 +5,27 @@ import { MOD_DIR, PERSIST_DIR } from '../constant'
 import type { useSnackBar } from '../components/SnackBar'
 
 export class Cli {
-  static nuke(show: ReturnType<typeof useSnackBar>['show']): Promise<void> {
+  static nuke(show: ReturnType<typeof useSnackBar>['show']): Promise<boolean> {
     return new Promise(resolve => {
-      let out: string = '', err: string[] = []
-      const ps = spawn('busybox', ['nsenter', '-t1', '-m', `${MOD_DIR}/nuke.sh`], {
-        env: { PATH: '/data/adb/ap/bin:/data/adb/ksu/bin:/data/adb/magisk:$PATH' }
-      })
+      let out = ''
+      const err: string[] = []
+      let ps: ReturnType<typeof spawn>
+      try {
+        ps = spawn('busybox', ['nsenter', '-t1', '-m', `${MOD_DIR}/nuke.sh`], {
+          env: { PATH: '/data/adb/ap/bin:/data/adb/ksu/bin:/data/adb/magisk:$PATH' }
+        })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        show(t('nuke.error', { stderr: message }), false)
+        resolve(false)
+        return
+      }
       ps.stdout.on('data', data => out += data)
       ps.stderr.on('data', data => err.push(data))
       ps.on('exit', code => {
         if (code !== 0) {
           show(t('nuke.error', { stderr: err.join('\n') }), false)
-          return resolve()
+          return resolve(false)
         }
         if (out.includes('Uninstall only mode')) {
           show(t('nuke.success_no_reboot'))
@@ -26,11 +35,11 @@ export class Cli {
             callback: () => Cli.reboot(show),
           })
         }
-        resolve()
+        resolve(true)
       })
       ps.on('error', error => {
         show(t('nuke.error', { stderr: error.message }), false)
-        resolve()
+        resolve(false)
       })
     })
   }
@@ -44,7 +53,12 @@ export class Cli {
   static async restore(restore: boolean = true): Promise<boolean> {
     const { errno } = await exec(`
       for f in ${PERSIST_DIR}/*.bak; do
-        ${restore ? `mv -f $f \${f%.bak}` : `rm -f $f`}
+        [ -f "$f" ] || continue
+        ${restore ? `
+          target="\${f%.bak}"
+          tmp="$target.restore.$$"
+          cp -f "$f" "$tmp" && mv -f "$tmp" "$target" || { rm -f "$tmp"; exit 1; }
+        ` : `rm -f "$f" || exit 1`}
       done;
     `)
     return errno === 0

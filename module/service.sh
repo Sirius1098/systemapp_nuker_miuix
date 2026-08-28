@@ -1,6 +1,7 @@
 MODDIR="/data/adb/modules/system_app_nuker"
 PERSIST_DIR="/data/adb/system_app_nuker"
 REMOVE_LIST="$PERSIST_DIR/nuke_list.txt"
+RAW_LIST="$PERSIST_DIR/raw_whiteouts.txt"
 
 # import config
 mounting_mode=0
@@ -102,23 +103,42 @@ echo "BOOTCOUNT=0" > "$PERSIST_DIR/count.sh"
 chmod 755 "$PERSIST_DIR/count.sh"
 
 # this make sure that restored app is back
+FAILED_RESTORES="$PERSIST_DIR/restore_failed.tmp"
+rm -f "$FAILED_RESTORES"
 if [ -s "$REMOVE_LIST.old" ]; then
-    grep_cmd="grep -Fvxf $REMOVE_LIST"
-    [ ! -s "$REMOVE_LIST" ] && grep_cmd="cat"
-    for pkg in $($grep_cmd "$REMOVE_LIST.old" | awk '{print $1}'); do
-        pm install-existing "$pkg" >/dev/null 2>&1 || true
-    done
+    while IFS= read -r old_line || [ -n "$old_line" ]; do
+        case "$old_line" in
+            ""|\#*) continue ;;
+        esac
+        pkg=$(echo "$old_line" | awk '{print $1}')
+        awk -v pkg="$pkg" '$1 == pkg { found=1 } END { exit !found }' "$REMOVE_LIST" 2>/dev/null && continue
+        restore_success=true
+        pm install-existing "$pkg" >/dev/null 2>&1 || restore_success=false
+        pm enable "$pkg" >/dev/null 2>&1 || restore_success=false
+        [ "$restore_success" = true ] || echo "$old_line" >> "$FAILED_RESTORES" || exit 1
+    done < "$REMOVE_LIST.old"
 fi
 
 # make sure app is uninstalled if user is switching to uninstall only mode
 if [ -s "$REMOVE_LIST" ] && [ "$uninstall_only_mode" = "true" ]; then
-    for pkg in $(cat "$REMOVE_LIST" | awk '{print $1}'); do
+    for pkg in $(grep -Ev "^$|^#" "$REMOVE_LIST" | awk '{print $1}'); do
         pm uninstall --user 0 "$pkg" >/dev/null 2>&1 || true
     done
 fi
 
 # ensure the remove list exists and save nuked apps to old list
-[ -f "$REMOVE_LIST" ] || touch "$REMOVE_LIST"
-cp -f "$REMOVE_LIST" "$REMOVE_LIST.old"
+[ -f "$REMOVE_LIST" ] || touch "$REMOVE_LIST" || exit 1
+SNAPSHOT="$REMOVE_LIST.old.new.$$"
+cp -f "$REMOVE_LIST" "$SNAPSHOT" || { rm -f "$SNAPSHOT"; exit 1; }
+if [ -s "$SNAPSHOT" ] && [ "$(tail -c 1 "$SNAPSHOT" | wc -l)" -eq 0 ]; then
+    echo >> "$SNAPSHOT" || { rm -f "$SNAPSHOT"; exit 1; }
+fi
+[ ! -f "$FAILED_RESTORES" ] || cat "$FAILED_RESTORES" >> "$SNAPSHOT" || { rm -f "$SNAPSHOT"; exit 1; }
+mv -f "$SNAPSHOT" "$REMOVE_LIST.old" || { rm -f "$SNAPSHOT"; exit 1; }
+rm -f "$FAILED_RESTORES"
+[ -f "$RAW_LIST" ] || touch "$RAW_LIST" || exit 1
+RAW_SNAPSHOT="$RAW_LIST.old.new.$$"
+cp -f "$RAW_LIST" "$RAW_SNAPSHOT" || { rm -f "$RAW_SNAPSHOT"; exit 1; }
+mv -f "$RAW_SNAPSHOT" "$RAW_LIST.old" || { rm -f "$RAW_SNAPSHOT"; exit 1; }
 
 # EOF

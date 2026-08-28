@@ -12,14 +12,17 @@ import { Cli } from '../lib/Cli'
 import { REPO, TELEGRAM, LOCAL_STORAGE_KEY } from '../constant'
 import TelegramIcon from '../assets/telegram.svg?react'
 import WhiteoutIcon from '../assets/folder_off.svg?react'
+import { runMutation } from '../lib/mutationLock'
 
 export default function Settings() {
   const { t } = useTranslation()
   const snackBar = useSnackBar()
   const appListManager = useAppList()
   const [config, setConfig] = useState<ConfigLib | null>(null)
+  const [loadFailed, setLoadFailed] = useState(false)
   const [items, setItems] = useState<ConfigLib['config']>([])
   const [fileSelectorOpen, setFileSelectorOpen] = useState(false)
+  const [saving, setSaving] = useState(false)
   const [whiteoutEnabled, setWhiteoutEnabled] = useState(() => {
     return localStorage.getItem(LOCAL_STORAGE_KEY + 'use-whiteout') === 'true'
   })
@@ -36,18 +39,33 @@ export default function Settings() {
     cfg.read().then(() => {
       setConfig(cfg)
       setItems(cfg.config)
-    })
+    }).catch(() => setLoadFailed(true))
   }, [])
 
   const handleSave = async (key: string, value: string | boolean | number) => {
     if (!config) return
-    config.config = config.config.map(item =>
-      item.key === key ? { ...item, value } : item
-    )
-    setItems(config.config)
-    await config.write().catch(() => {
-      snackBar.show(t('global.write_error'), false)
+    const started = await runMutation(async () => {
+      setSaving(true)
+      const updated = new ConfigLib()
+      updated.config = config.config.map(item =>
+        item.key === key ? { ...item, value } : item
+      )
+
+      try {
+        await updated.write()
+        setConfig(updated)
+        setItems(updated.config)
+      } catch {
+        setItems([...config.config])
+        snackBar.show(t('global.write_error'), false)
+      } finally {
+        setSaving(false)
+      }
     })
+    if (!started) {
+      setItems([...config.config])
+      snackBar.show(t('global.processing'), true, 3000)
+    }
   }
 
   const handleImport = async (content: string | null) => {
@@ -62,7 +80,9 @@ export default function Settings() {
   if (!config) {
     return (
       <div className="flex items-center justify-center h-full">
-        <md-circular-progress indeterminate />
+        {loadFailed
+          ? <span className="text-error">{t('global.read_error')}</span>
+          : <md-circular-progress indeterminate />}
       </div>
     )
   }
@@ -139,7 +159,7 @@ export default function Settings() {
       <div className="text-sm text-primary ps-8 pb-2">
         {t('settings.config')}
       </div>
-      <Config items={items} onSave={handleSave} />
+      <Config items={items} onSave={handleSave} disabled={saving} />
       <div className="text-sm text-primary ps-8 pb-2">
         Advanced
       </div>

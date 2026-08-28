@@ -10,11 +10,12 @@ MODULE_UPDATE_DIR="/data/adb/modules_update/system_app_nuker"
 PERSIST_DIR="/data/adb/system_app_nuker"
 # nuke_list.txt is "<pkg> <path> <label>". pm path cant see nuked apps
 # (theyre hidden by whiteouts), so the saved path is reused when pm fails
-REMOVE_LIST="$PERSIST_DIR/nuke_list.txt"
+REMOVE_LIST="${REMOVE_LIST:-$PERSIST_DIR/nuke_list.txt}"
 
 # import config
 uninstall_only_mode="false"
-[ -f "$PERSIST_DIR/config.sh" ] && . $PERSIST_DIR/config.sh
+CONFIG_FILE="${CONFIG_FILE:-$PERSIST_DIR/config.sh}"
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
 # special dirs
 # handle this properly so this script can be used standalone
@@ -23,6 +24,7 @@ IFS="
 "
 # vendor partitions
 targets="
+odm
 mi_ext
 my_bigball
 my_carrier
@@ -38,25 +40,283 @@ my_stock"
 
 # args handling
 [ "$1" = "update" ] && update=true || update=false
+restore_all_legacy=false
 
 # ----- functions -----
 
 # whiteout creator
 whiteout_create() {
     path="$1"
+    case "/$path/" in
+        */../*|*/./*)
+            echo "invalid whiteout path: $path" >&2
+            return 1
+            ;;
+    esac
     echo "$path" | grep -q "^/system/" || path="/system$1"
-    mkdir -p "$MODULE_UPDATE_DIR${path%/*}"
-    chmod 755 "$MODULE_UPDATE_DIR${path%/*}"
-    busybox mknod "$MODULE_UPDATE_DIR$path" c 0 0
-    busybox chcon --reference="/system" "$MODULE_UPDATE_DIR$path"
+    target="$MODULE_UPDATE_DIR$path"
+    mkdir -p "${target%/*}" || return 1
+    chmod 755 "${target%/*}" || return 1
+    rm -f "$target"
+    if ! busybox mknod "$target" c 0 0; then
+        echo "failed to create whiteout: $path" >&2
+        return 1
+    fi
+    busybox chcon --reference="/system" "$target" || true
     # not really required, mountify() does NOT even copy the attribute but ok
-    busybox setfattr -n trusted.overlay.whiteout -v y "$MODULE_UPDATE_DIR$path"
-    chmod 644 "$MODULE_UPDATE_DIR$path"
+    busybox setfattr -n trusted.overlay.whiteout -v y "$target" || true
+    chmod 644 "$target" || return 1
+}
+
+normalize_whiteout_path() {
+    case "$1" in
+        /system/*) echo "$1" ;;
+        /*) echo "/system$1" ;;
+        *) echo "/system/$1" ;;
+    esac
+}
+
+is_apk_path() {
+    case "$1" in
+        /*.apk) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+append_line() {
+    file="$1"
+    line="$2"
+    temp_file="$file.append.$$"
+    if [ -f "$file" ]; then
+        cp -f "$file" "$temp_file" || { rm -f "$temp_file"; return 1; }
+    else
+        : > "$temp_file" || return 1
+    fi
+    if [ -s "$temp_file" ] && [ "$(tail -c 1 "$temp_file" | wc -l)" -eq 0 ]; then
+        echo >> "$temp_file" || { rm -f "$temp_file"; return 1; }
+    fi
+    echo "$line" >> "$temp_file" || { rm -f "$temp_file"; return 1; }
+    mv -f "$temp_file" "$file" || { rm -f "$temp_file"; return 1; }
+}
+
+replace_file() {
+    source_file="$1"
+    target_file="$2"
+    temp_file="$target_file.tmp.$$"
+    if [ -f "$source_file" ]; then
+        cp -f "$source_file" "$temp_file" || { rm -f "$temp_file"; return 1; }
+    else
+        : > "$temp_file" || return 1
+    fi
+    mv -f "$temp_file" "$target_file" || { rm -f "$temp_file"; return 1; }
+}
+
+whiteout_has_saved_path() {
+    target="$1"
+    [ -f "$REMOVE_LIST" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ""|\#*) continue ;;
+        esac
+        saved_path=$(echo "$line" | awk '{print $2}')
+        is_apk_path "$saved_path" || continue
+        [ "$(normalize_whiteout_path "$(dirname "$saved_path")")" = "$target" ] && return 0
+    done < "$REMOVE_LIST"
+    return 1
+}
+
+whiteout_is_raw() {
+    target="$1"
+    [ -f "$PERSIST_DIR/raw_whiteouts.txt" ] || return 1
+    while IFS= read -r raw_path || [ -n "$raw_path" ]; do
+        case "$raw_path" in
+            ""|\#*) continue ;;
+        esac
+        [ "$(normalize_whiteout_path "$raw_path")" = "$target" ] && return 0
+    done < "$PERSIST_DIR/raw_whiteouts.txt"
+    return 1
+}
+
+raw_whiteout_was_restored() {
+    restore_target="$1"
+    [ -f "$PERSIST_DIR/raw_whiteouts.txt.old" ] || return 1
+    while IFS= read -r old_raw_path || [ -n "$old_raw_path" ]; do
+        case "$old_raw_path" in
+            ""|\#*) continue ;;
+        esac
+        [ "$(normalize_whiteout_path "$old_raw_path")" = "$restore_target" ] || continue
+        whiteout_is_raw "$restore_target" && return 1
+        return 0
+    done < "$PERSIST_DIR/raw_whiteouts.txt.old"
+    return 1
+}
+
+whiteout_was_restored() {
+    restore_target="$1"
+    [ -f "$REMOVE_LIST.old" ] || return 1
+    while IFS= read -r old_line || [ -n "$old_line" ]; do
+        case "$old_line" in
+            ""|\#*) continue ;;
+        esac
+        old_package_name=$(echo "$old_line" | awk '{print $1}')
+        old_saved_path=$(echo "$old_line" | awk '{print $2}')
+        is_apk_path "$old_saved_path" || continue
+        [ "$(normalize_whiteout_path "$(dirname "$old_saved_path")")" = "$restore_target" ] || continue
+        awk -v pkg="$old_package_name" '$1 == pkg { found=1 } END { exit !found }' "$REMOVE_LIST" 2>/dev/null || return 0
+    done < "$REMOVE_LIST.old"
+    return 1
+}
+
+# keep the whiteouts that are already active while rebuilding the module
+preserve_whiteouts() {
+    for old_whiteout in $(find "$MODDIR" -type c 2>/dev/null); do
+        [ "$restore_all_legacy" = true ] && continue
+        whiteout=$(normalize_whiteout_path "${old_whiteout#"$MODDIR"}")
+        raw_whiteout_was_restored "$whiteout" && continue
+        whiteout_was_restored "$whiteout" && continue
+        whiteout_create "$whiteout" > /dev/null || return 1
+        if ! whiteout_has_saved_path "$whiteout" && ! whiteout_is_raw "$whiteout" && ! grep -Fqx "# legacy-whiteout $whiteout" "$REMOVE_LIST" 2>/dev/null; then
+            append_line "$REMOVE_LIST" "# legacy-whiteout $whiteout" || return 1
+        fi
+    done
+}
+
+# update from saved paths without asking pm about apps it cant see
+nuke_saved_apps() {
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ""|\#*) continue ;;
+        esac
+        saved_path=$(echo "$line" | awk '{print $2}')
+        is_apk_path "$saved_path" || continue
+        whiteout_create "$(dirname "$saved_path")" > /dev/null || return 1
+    done < "$REMOVE_LIST"
+}
+
+nuke_legacy_whiteouts() {
+    [ -f "$REMOVE_LIST" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            "# legacy-whiteout "*)
+                whiteout_create "${line#\# legacy-whiteout }" > /dev/null || return 1
+                ;;
+        esac
+    done < "$REMOVE_LIST"
+}
+
+check_legacy_restores() {
+    [ -f "$REMOVE_LIST.old" ] || return 0
+    legacy_kept=false
+    legacy_removed=false
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ""|\#*) continue ;;
+        esac
+        package_name=$(echo "$line" | awk '{print $1}')
+        saved_path=$(echo "$line" | awk '{print $2}')
+        is_apk_path "$saved_path" && continue
+        if awk -v pkg="$package_name" '$1 == pkg { found=1 } END { exit !found }' "$REMOVE_LIST" 2>/dev/null; then
+            legacy_kept=true
+        else
+            legacy_removed=true
+        fi
+    done < "$REMOVE_LIST.old"
+
+    if [ "$legacy_removed" = true ] && [ "$legacy_kept" = false ]; then
+        restore_all_legacy=true
+        return 0
+    fi
+    if [ "$legacy_removed" = true ]; then
+        echo "cant restore old apps one at a time because their paths werent saved" >&2
+        return 1
+    fi
+}
+
+# fill missing paths while newly selected apps are still visible
+prepare_nuke_list() {
+    check_legacy_restores || return 1
+    [ -s "$REMOVE_LIST" ] || return 0
+    list_tmp="$REMOVE_LIST.tmp.$$"
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ""|\#*) echo "$line" || { rm -f "$list_tmp"; return 1; }; continue ;;
+        esac
+
+        package_name=$(echo "$line" | awk '{print $1}')
+        saved_path=$(echo "$line" | awk '{print $2}')
+        if is_apk_path "$saved_path"; then
+            label=$(echo "$line" | sed 's/^[^ ]* [^ ]* *//')
+        elif echo "$saved_path" | grep -q '^/system/'; then
+            # 2.1.1 guessed this path from whiteout order, dont trust it
+            label=$(echo "$line" | sed 's/^[^ ]* [^ ]* *//')
+            saved_path=""
+        else
+            label=$(echo "$line" | sed 's/^[^ ]* *//')
+            saved_path=""
+        fi
+        apk_path=$(pm path "$package_name" | head -n1 | sed 's/package://')
+        if echo "$apk_path" | grep -q '^/data/app' && pm list packages -s | grep -qx "package:$package_name"; then
+            if [ "$update" = true ]; then
+                pm uninstall-system-updates "$package_name" >/dev/null 2>&1 || true
+                apk_path=$(pm path "$package_name" | head -n1 | sed 's/package://')
+            else
+                if [ -n "$saved_path" ]; then
+                    echo "$package_name $saved_path $label" || { rm -f "$list_tmp"; return 1; }
+                else
+                    echo "$package_name  $label" || { rm -f "$list_tmp"; return 1; }
+                fi
+                continue
+            fi
+        fi
+
+        if [ -z "$apk_path" ]; then
+            if [ -n "$saved_path" ]; then
+                echo "$package_name $saved_path $label" || { rm -f "$list_tmp"; return 1; }
+                continue
+            fi
+            if [ -f "$REMOVE_LIST.old" ] && awk -v pkg="$package_name" '$1 == pkg { found=1 } END { exit !found }' "$REMOVE_LIST.old"; then
+                echo "$package_name  $label" || { rm -f "$list_tmp"; return 1; }
+                continue
+            fi
+            if [ "$update" = true ] && find "$MODDIR" -type c 2>/dev/null | grep -q .; then
+                echo "$package_name  $label" || { rm -f "$list_tmp"; return 1; }
+                continue
+            fi
+            echo "cant find apk path for $package_name" >&2
+            rm -f "$list_tmp"
+            return 1
+        fi
+        if echo "$apk_path" | grep -q '^/data/app'; then
+            echo "cant find system apk for $package_name" >&2
+            rm -f "$list_tmp"
+            return 1
+        fi
+
+        echo "$package_name $apk_path $label" || { rm -f "$list_tmp"; return 1; }
+    done < "$REMOVE_LIST" > "$list_tmp" || { rm -f "$list_tmp"; return 1; }
+
+    if [ "$restore_all_legacy" != true ] && [ -f "$REMOVE_LIST.old" ]; then
+        while IFS= read -r metadata || [ -n "$metadata" ]; do
+            case "$metadata" in
+                "# legacy-whiteout "*)
+                    grep -Fqx "$metadata" "$list_tmp"
+                    grep_status=$?
+                    [ "$grep_status" -eq 0 ] && continue
+                    [ "$grep_status" -eq 1 ] || { rm -f "$list_tmp"; return 1; }
+                    echo "$metadata" >> "$list_tmp" || { rm -f "$list_tmp"; return 1; }
+                    ;;
+            esac
+        done < "$REMOVE_LIST.old"
+    fi
+
+    mv -f "$list_tmp" "$REMOVE_LIST" || { rm -f "$list_tmp"; return 1; }
 }
 
 # nuke app from REMOVE_LIST
 nuke_system_apps() {
     total=$(grep -Ev "^$|^#" "$REMOVE_LIST" | wc -l)
+    list_tmp="$REMOVE_LIST.tmp.$$"
 
     # remove any updates for the apps being nuked
     for package_name in $(grep -Ev "^$|^#" "$REMOVE_LIST" | awk '{print $1}'); do
@@ -74,19 +334,15 @@ nuke_system_apps() {
         # whiteout creation. the list is "<pkg> <path> <label>" — rewrite it
         # with fresh paths when pm can see the app, keep the saved path
         # otherwise (nuked apps are hidden by whiteouts so pm fails)
-        # old (<2.1.0) lists have no path column, recover it from the whiteouts
-        # already in the module tree when pm also cant see the app
-        old_paths=$(find "$MODDIR/system" -type c 2>/dev/null | sed "s|^$MODDIR/system|/system|")
-        i=1
         # webui writes the list without a trailing newline, append one or the
         # last app never gets processed
-        { cat "$REMOVE_LIST"; echo; } | while IFS= read -r line; do
+        while IFS= read -r line || [ -n "$line" ]; do
             case "$line" in
-                ""|\#*) echo "$line"; continue ;;
+                ""|\#*) echo "$line" || { rm -f "$list_tmp"; return 1; }; continue ;;
             esac
             package_name=$(echo "$line" | awk '{print $1}')
             saved_path=$(echo "$line" | awk '{print $2}')
-            if echo "$saved_path" | grep -q "^/"; then
+            if is_apk_path "$saved_path"; then
                 # drop pkg and path, the rest is label
                 label=$(echo "$line" | sed 's/^[^ ]* [^ ]* *//')
             else
@@ -96,19 +352,21 @@ nuke_system_apps() {
             fi
             apk_path=$(pm path "$package_name" | head -n1 | sed "s/package://")
             [ "$apk_path" = "" ] && apk_path="$saved_path"
-            if [ "$apk_path" = "" ] && [ -n "$old_paths" ]; then
-                # hidden app without a saved path, pull one from the module tree
-                apk_path=$(echo "$old_paths" | sed -n "${i}p")
-                [ "$apk_path" != "" ] && apk_path="$apk_path/$(basename "$apk_path")"
-                i=$((i+1))
+            if echo "$apk_path" | grep -q '^/data/app'; then
+                echo "cant remove system update for $package_name" >&2
+                rm -f "$list_tmp"
+                return 1
             fi
             if [ "$apk_path" != "" ]; then
-                whiteout_create "$(dirname "$apk_path")" > /dev/null 2>&1
+                if ! whiteout_create "$(dirname "$apk_path")" > /dev/null; then
+                    rm -f "$list_tmp"
+                    return 1
+                fi
                 ls "$MODULE_UPDATE_DIR$apk_path" 2>/dev/null
             fi
-            echo "$package_name $apk_path $label"
-        done > "$REMOVE_LIST.tmp"
-        mv -f "$REMOVE_LIST.tmp" "$REMOVE_LIST"
+            echo "$package_name $apk_path $label" || { rm -f "$list_tmp"; return 1; }
+        done < "$REMOVE_LIST" > "$list_tmp" || { rm -f "$list_tmp"; return 1; }
+        mv -f "$list_tmp" "$REMOVE_LIST" || { rm -f "$list_tmp"; return 1; }
     fi
 
     # when uninstall_only_mode=true and restore_success=false means user has enabled uninstall only mode
@@ -117,13 +375,15 @@ nuke_system_apps() {
     # showing "Uninstall only mode detected" to stdout allows webui to skip the reboot button
     restore_success="true"
     if [ -f "$REMOVE_LIST.old" ]; then
-        for pkg in $(cat "$REMOVE_LIST.old" | grep -Fvxf "$REMOVE_LIST" | awk '{print $1}'); do
+        for pkg in $(grep -Ev "^$|^#" "$REMOVE_LIST.old" | awk '{print $1}'); do
+            awk -v pkg="$pkg" '$1 == pkg { found=1 } END { exit !found }' "$REMOVE_LIST" 2>/dev/null && continue
             pm install-existing "$pkg" >/dev/null 2>&1 || restore_success="false"
+            pm enable "$pkg" >/dev/null 2>&1 || restore_success="false"
         done
     fi
     if [ "$uninstall_only_mode" = "true" ] && [ "$restore_success" = "true" ]; then
         echo "[-] Uninstall only mode detected"
-        [ -f "$REMOVE_LIST" ] && cp -f "$REMOVE_LIST" "$REMOVE_LIST".old
+        [ ! -f "$REMOVE_LIST" ] || replace_file "$REMOVE_LIST" "$REMOVE_LIST.old" || return 1
     fi
 
     echo "[-] Nuking complete: $total apps processed"
@@ -161,9 +421,18 @@ install_dummy() {
 
 # lets have customize.sh of dummy.zip call us.
 if [ ! "$DUMMYZIP" = "true" ] && [ ! "$update" = true ]; then
-    # install dummy.zip
-    install_dummy
-    exit $?
+    if prepare_nuke_list && install_dummy; then
+        exit 0
+    fi
+    replace_file "$REMOVE_LIST.old" "$REMOVE_LIST" || exit 1
+    replace_file "$PERSIST_DIR/raw_whiteouts.txt.old" "$PERSIST_DIR/raw_whiteouts.txt" || exit 1
+    exit 1
+fi
+
+if [ "$update" = true ]; then
+    prepare_nuke_list || exit 1
+elif [ "$DUMMYZIP" = true ]; then
+    check_legacy_restores || exit 1
 fi
 
 # ----- main script -----
@@ -174,8 +443,10 @@ fi
 # this can avoid persistence issues too
 
 # create folder if it doesnt exist and copy selinux context
-[ ! -d "$MODULE_UPDATE_DIR" ] && mkdir -p "$MODULE_UPDATE_DIR"
-busybox chcon --reference="/system" "$MODULE_UPDATE_DIR"
+if [ ! -d "$MODULE_UPDATE_DIR" ]; then
+    mkdir -p "$MODULE_UPDATE_DIR" || exit 1
+fi
+busybox chcon --reference="/system" "$MODULE_UPDATE_DIR" || true
 
 # if not update
 if [ "$update" != true ]; then
@@ -183,7 +454,7 @@ if [ "$update" != true ]; then
     # only copy content if module files was not copied yet
     # this ensure updated files are not overwritten
     if [ ! -f "$MODULE_UPDATE_DIR/nuke.sh" ]; then
-        cp -Lrf "$MODDIR"/* "$MODULE_UPDATE_DIR"
+        cp -Lrf "$MODDIR"/* "$MODULE_UPDATE_DIR" || exit 1
     fi
 
     # flag module for update
@@ -192,27 +463,44 @@ if [ "$update" != true ]; then
 fi
 
 # cleanup all old setup
-for item in system system_ext vendor product update; do
+for item in system system_ext vendor product update $targets; do
     rm -rf "$MODULE_UPDATE_DIR/$item"
 done
 
-# skip app whiteout creation when remove list is empty
-if [ -s "$REMOVE_LIST" ]; then
-    nuke_system_apps
+# old whiteouts are still mounted here. keep them because pm cant see the
+# apps anymore and old 2.0 lists dont have their paths
+if [ "$DUMMYZIP" = true ] && [ "$uninstall_only_mode" != "true" ]; then
+    preserve_whiteouts || exit 1
+fi
+if [ "$update" = true ] && [ "$uninstall_only_mode" != "true" ]; then
+    preserve_whiteouts || exit 1
+    if [ -s "$REMOVE_LIST" ]; then
+        nuke_saved_apps || exit 1
+    fi
+elif [ -s "$REMOVE_LIST" ]; then
+    nuke_system_apps || exit 1
+fi
+if [ "$uninstall_only_mode" != "true" ]; then
+    nuke_legacy_whiteouts || exit 1
 fi
 
 # handle raw whiteout
-for line in $( sed '/#/d' "$PERSIST_DIR/raw_whiteouts.txt" ); do
-	whiteout_create "$line" > /dev/null 2>&1 
-	ls "$MODULE_UPDATE_DIR$line" 2>/dev/null
-done
+if [ -f "$PERSIST_DIR/raw_whiteouts.txt" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ""|\#*) continue ;;
+        esac
+        whiteout_create "$line" > /dev/null || exit 1
+        ls "$MODULE_UPDATE_DIR$line" 2>/dev/null
+    done < "$PERSIST_DIR/raw_whiteouts.txt"
+fi
 
 # handle vendor partitions
 for part in $targets; do
     if [ -d "$MODULE_UPDATE_DIR/system/$part" ] && [ ! -L "/$part" ]; then
         echo "[-] Handling partition /$part"
-        mv -f "$MODULE_UPDATE_DIR/system/$part" "$MODULE_UPDATE_DIR/$part"
-        ln -sf "../$part" "$MODULE_UPDATE_DIR/system/$part"
+        mv -f "$MODULE_UPDATE_DIR/system/$part" "$MODULE_UPDATE_DIR/$part" || exit 1
+        ln -sf "../$part" "$MODULE_UPDATE_DIR/system/$part" || exit 1
     fi
 done
 

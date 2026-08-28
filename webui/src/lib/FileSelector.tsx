@@ -2,9 +2,10 @@ import { useState, useRef, useEffect, useCallback, useLayoutEffect } from 'react
 import { createPortal } from 'react-dom'
 import { exec } from 'kernelsu-alt'
 import type { MdDialog } from '@material/web/dialog/dialog.js'
-import { useDialogAnimation } from '../hooks/useDialogAnimation'
+import { customizeDialogAnimation } from '../hooks/useDialogAnimation'
 import { useHistory } from '../hooks/useHistory'
 import type { MdFilledTextField } from '@material/web/all'
+import { shellFileFilter, shellQuote } from './shell'
 
 interface FileItem {
   name: string
@@ -41,10 +42,11 @@ export default function FileSelector({ open, fileType, mode: rawMode = 'path', f
     }
 
     const dirPath = dir(path)
-    const fileFilter = fileType === 'any' ? 'echo "f|$f"' : `[[ "$f" == *.${fileType} ]] && echo "f|$f"`
+    const fileFilter = shellFileFilter(fileType)
     const result = await exec(`
-      cd "${path}"
+      cd ${shellQuote(path)} || exit 1
       for f in *; do
+        [ "$f" = "*" ] && [ ! -e "$f" ] && continue
         [ -d "$f" ] && echo "d|$f" || { ${fileFilter}; }
       done | sort
     `)
@@ -75,7 +77,7 @@ export default function FileSelector({ open, fileType, mode: rawMode = 'path', f
 
   useEffect(() => {
     if (!dialogRef.current) return
-    useDialogAnimation(dialogRef.current)
+    customizeDialogAnimation(dialogRef.current)
     if (open) {
       setCurrentPath(root)
       setInputValue(root)
@@ -131,7 +133,8 @@ export default function FileSelector({ open, fileType, mode: rawMode = 'path', f
         return
       }
       if (value.startsWith(root)) {
-        const result = await exec(`[ -f "${value}" ] && echo file || ([ -d "${value}" ] && echo dir || echo none)`)
+        const quoted = shellQuote(value)
+        const result = await exec(`[ -f ${quoted} ] && echo file || ([ -d ${quoted} ] && echo dir || echo none)`)
         const entryType = result.stdout?.trim()
         if (entryType === 'file') {
           const name = value.split('/').filter(Boolean).pop() || ''
@@ -144,7 +147,7 @@ export default function FileSelector({ open, fileType, mode: rawMode = 'path', f
           items.push({ name, path: value, isDirectory: false })
           setFiles(items)
           setCurrentPath(pDir)
-        } else {
+        } else if (entryType === 'dir') {
           setCurrentPath(dir(value))
           listFiles(value)
         }
@@ -164,7 +167,7 @@ export default function FileSelector({ open, fileType, mode: rawMode = 'path', f
       }
     } else {
       if (mode === 'content') {
-        const result = await exec(`cat "${item.path}"`)
+        const result = await exec(`cat ${shellQuote(item.path)}`)
         onSelect(result.errno === 0 ? result.stdout : null)
       } else {
         onSelect(item.path)

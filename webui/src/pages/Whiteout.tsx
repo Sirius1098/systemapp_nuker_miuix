@@ -9,6 +9,7 @@ import FileSelector from '../lib/FileSelector'
 import { Whiteout as WhiteoutManager } from '../lib/Whiteout'
 import { Cli } from '../lib/Cli'
 import { useHistory } from '../hooks/useHistory'
+import { runMutation } from '../lib/mutationLock'
 
 const whiteoutManager = new WhiteoutManager()
 
@@ -17,6 +18,7 @@ export default function WhiteoutPage() {
   const snackBar = useSnackBar()
   const [whiteouts, setWhiteouts] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
+  const [loadFailed, setLoadFailed] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const [editMode, setEditMode] = useState(false)
   const [allSelected, setAllSelected] = useState(false)
@@ -27,6 +29,9 @@ export default function WhiteoutPage() {
   useEffect(() => {
     whiteoutManager.waitForReady().then(() => {
       setWhiteouts(whiteoutManager.whiteouts)
+      setLoading(false)
+    }).catch(() => {
+      setLoadFailed(true)
       setLoading(false)
     })
   }, [])
@@ -66,17 +71,27 @@ export default function WhiteoutPage() {
     }
   }
 
+  const saveWhiteouts = async (next: string[]) => {
+    const started = await runMutation(async () => {
+      whiteoutManager.whiteouts = next
+      const ok = await whiteoutManager.write()
+      if (!ok) {
+        snackBar.show(t('global.write_error'), false)
+      } else {
+        await Cli.nuke(snackBar.show)
+        await whiteoutManager.refresh().catch(() => {
+          setLoadFailed(true)
+          snackBar.show(t('global.read_error'), false)
+        })
+      }
+      setWhiteouts([...whiteoutManager.whiteouts])
+    })
+    if (!started) snackBar.show(t('global.processing'), true, 3000)
+  }
+
   const handleDelete = async () => {
     const selected = whiteoutListRef.current?.getSelectedWhiteouts() ?? []
-    const remaining = whiteouts.filter(w => !selected.includes(w))
-    whiteoutManager.whiteouts = remaining
-    const ok = await whiteoutManager.write()
-    if (!ok) {
-      snackBar.show(t('global.write_error'), false)
-    } else {
-      Cli.nuke(snackBar.show)
-    }
-    setWhiteouts(remaining)
+    await saveWhiteouts(whiteouts.filter(w => !selected.includes(w)))
     handleClose()
   }
 
@@ -84,20 +99,21 @@ export default function WhiteoutPage() {
     setFileSelectorOpen(false)
     if (!value) return
     const finalPath = (value.startsWith('/system/') ? value : `/system${value}`).replace(/\/+$/, '')
-    whiteoutManager.whiteouts = [...whiteoutManager.whiteouts, finalPath]
-    const ok = await whiteoutManager.write()
-    if (!ok) {
-      snackBar.show(t('global.write_error'), false)
-    } else {
-      Cli.nuke(snackBar.show)
-    }
-    setWhiteouts(whiteoutManager.whiteouts)
+    await saveWhiteouts([...whiteoutManager.whiteouts, finalPath])
   }
 
   if (loading) {
     return (
       <div className="flex items-center justify-center h-full">
         <md-circular-progress indeterminate />
+      </div>
+    )
+  }
+
+  if (loadFailed) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <span className="text-error">{t('global.read_error')}</span>
       </div>
     )
   }

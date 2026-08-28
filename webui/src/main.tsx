@@ -13,6 +13,7 @@ import BackupRestoreDialog from './components/dialog/BackupRestoreDialog'
 import SnackBar, { useSnackBar } from './components/SnackBar'
 import { Cli } from './lib/Cli'
 import { AppListProvider } from './lib/AppListContext'
+import { runMutation } from './lib/mutationLock'
 
 const pages: Record<string, React.FC> = {
   '/': Home,
@@ -24,7 +25,7 @@ const pages: Record<string, React.FC> = {
 function App() {
   const [activeTab, setActiveTab] = useState('/')
   const [showBackupRestoreDialog, setShowBackupRestoreDialog] = useState(false)
-  const snackBar = useSnackBar()
+  const { state: snackBarState, show: showSnackBar, hide: hideSnackBar } = useSnackBar()
 
   useEffect(() => {
     Cli.needRestore().then(needRestore => {
@@ -38,23 +39,37 @@ function App() {
 
   const handleDontRestore = useCallback(async () => {
     setShowBackupRestoreDialog(false)
-    const ok = await Cli.restore(false)
-    if (ok) {
-      location.reload()
-    } else {
-      snackBar.show(t('backup.error'), false)
+    const started = await runMutation(async () => {
+      const ok = await Cli.restore(false)
+      if (ok) {
+        location.reload()
+      } else {
+        showSnackBar(t('backup.error'), false)
+      }
+    })
+    if (!started) {
+      setShowBackupRestoreDialog(true)
+      showSnackBar(t('global.processing'), true, 3000)
     }
-  }, [snackBar.show])
+  }, [showSnackBar])
 
   const handleRestore = useCallback(async () => {
     setShowBackupRestoreDialog(false)
-    const ok = await Cli.restore(true)
-    if (ok) {
-      Cli.nuke(snackBar.show)
-    } else {
-      snackBar.show(t('backup.error'), false)
+    const started = await runMutation(async () => {
+      const ok = await Cli.restore(true)
+      if (!ok) {
+        showSnackBar(t('backup.error'), false)
+        return
+      }
+      if (await Cli.nuke(showSnackBar) && !await Cli.restore(false)) {
+        showSnackBar(t('backup.error'), false)
+      }
+    })
+    if (!started) {
+      setShowBackupRestoreDialog(true)
+      showSnackBar(t('global.processing'), true, 3000)
     }
-  }, [snackBar.show])
+  }, [showSnackBar])
 
   const Page = pages[activeTab] ?? Home
 
@@ -69,7 +84,7 @@ function App() {
         onDontRestore={handleDontRestore}
         onRestore={handleRestore}
       />
-      <SnackBar state={snackBar.state} onHide={snackBar.hide} />
+      <SnackBar state={snackBarState} onHide={hideSnackBar} />
     </>
   )
 }
