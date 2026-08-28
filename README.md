@@ -6,7 +6,7 @@
 
 san在2.0版本后 UI 更新成 Material
 
-root管理器不开 Monet 取色时，ui是奇怪的紫色再叠加英文看不懂和模块不生效，直接无能的红温了😭😭😭
+root 管理器不开 Monet 取色时，奇怪的紫色UI叠加英文看不懂和模块不生效的bug，直接无能的红温了😭😭😭
 
 拷打了DeepSeek-V4-flash一下午，参考了 [MMRS](https://github.com/Tools-cx-app/meta-magic_mount-rs) 的 MIUIX 实现方式😋😋😋
 
